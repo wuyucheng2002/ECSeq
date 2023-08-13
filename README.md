@@ -1,1 +1,1 @@
-# ECSeq
+Efficient User Behavior Sequential Learning with Compressed Graph Neural Networks
