@@ -1,7 +1,7 @@
 import numpy as np
 import torch.nn.functional as F
 import torch
-from torch.nn.utils.rnn import pack_sequence
+from torch.nn.utils.rnn import pack_sequence, pad_sequence
 from torch.utils.data import Dataset, DataLoader, Subset
 import pandas as pd
 from tqdm import tqdm
@@ -144,7 +144,7 @@ def correlation_edge(X1, X2, threshold):
     return torch.tensor(edges).T.long()
 
 
-class EncodedDataset0(Dataset):
+class EncodedDataset(Dataset):
     def __init__(self, df):
         super().__init__()
         drop_features = ['target_event_id', 'label', 'target_gmt_occur_cn', 'event_id', 'gmt_occur_cn', 'rn']
@@ -171,10 +171,7 @@ class EncodedDataset0(Dataset):
     
     
 
-def get_dataset(args, batch_size, device, collate_fn='default', EncodedDataset='default'):
-    if EncodedDataset == 'default':
-        EncodedDataset = EncodedDataset0
-    
+def get_dataset(args, batch_size, device):
     df_train = pd.read_csv('data/' + args.dataset + '_train.csv')
     df_val = pd.read_csv('data/' + args.dataset + '_val.csv')
     df_test = pd.read_csv('data/' + args.dataset + '_test.csv')
@@ -187,13 +184,12 @@ def get_dataset(args, batch_size, device, collate_fn='default', EncodedDataset='
 
     print(len(train_dataset), len(val_dataset), len(test_dataset))
 
-    if collate_fn == 'default':
-        def collate_fn0(batch):
-            inputs, labels, lengths, ends, idxs = zip(*batch)
-            inputs_pad = pack_sequence(inputs, enforce_sorted=False)
-            return inputs_pad.float().to(device), torch.LongTensor(labels).to(device), torch.LongTensor(lengths).to(device), \
-                torch.stack(ends, dim=0).float().to(device), torch.LongTensor(idxs).to(device)
-        collate_fn = collate_fn0
+    def collate_fn(batch):
+        inputs, labels, lengths, ends, idxs = zip(*batch)
+        # inputs_pad = pack_sequence(inputs, enforce_sorted=False)
+        inputs_pad = pad_sequence(inputs, batch_first=True)
+        return inputs_pad.float().to(device), torch.LongTensor(labels).to(device), torch.LongTensor(lengths).to(device), \
+            torch.stack(ends, dim=0).float().to(device), torch.LongTensor(idxs).to(device)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     train_loader2 = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)

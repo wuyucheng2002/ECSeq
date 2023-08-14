@@ -1,38 +1,13 @@
 {
-  "LZD": {
-    "gnn_epo": 100,
-    "ens_epo": 10,
-    "n_pos": 500,
-    "n_neg": 500
-  },
-
-  "HK": {
-    "gnn_epo": 300,
-    "ens_epo": 50,
-    "n_pos": 200,
-    "n_neg": 800
-  },
-
   "bike_nyc": {
-    "lstm_epo": 100,
-    "gnn_epo": 100,
-    "ens_epo": 100,
-    "eva": 1,
     "scalar_min": 0,
     "scalar_max": 100,
-    "cor_thres": 0.5,
-    "cor_thres_com": 0.75,
-    "n_cluster": 50
+    "cor_thres": 0.5
   },
 
   "pems_bay": {
-    "lstm_epo": 100,
-    "gnn_epo": 100,
-    "ens_epo": 100,
-    "eva": 1,
     "scalar_min": 3.1083333, 
     "scalar_max": 83.15833,
-    "cor_thres": 0.6,
-    "n_cluster": 50
+    "cor_thres": 0.6
   }
 }

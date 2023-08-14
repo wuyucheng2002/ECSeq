@@ -26,6 +26,7 @@ class LSTM(torch.nn.Module):
         self.fc = torch.nn.Linear(hidden_size, out_size)
 
     def forward(self, x, x_length, end):
+        x = pack_padded_sequence(x, x_length.cpu(), enforce_sorted=False, batch_first=True)
         x, _ = self.lstm(x)
         output, _ = pad_packed_sequence(x)
         target_x = []
@@ -33,26 +34,6 @@ class LSTM(torch.nn.Module):
             target_x.append(output[length - 1, j, :])
         target_x = torch.stack(target_x, dim=0)
         return target_x, self.fc(target_x).softmax(dim=1)
-    
-
-class xLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, layer_num):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, layer_num)
-        self.fc1 = nn.Linear(hidden_size + input_size, 32)
-        self.fc2 = nn.Linear(32, output_size)
-
-    def forward(self, x, x_length, end):
-        x, _ = self.lstm(x)
-        output, _ = pad_packed_sequence(x)
-        target_x = []
-        for j, length in enumerate(x_length):
-            target_x.append(output[length - 1, j, :])
-        target_x = torch.stack(target_x, dim=0)
-        x = torch.cat([target_x, end], dim=1)
-        x = self.fc1(x).relu()
-        x = self.fc2(x)
-        return target_x, x.softmax(dim=1)
     
 
 class GNN(torch.nn.Module):
@@ -65,49 +46,84 @@ class GNN(torch.nn.Module):
         elif self.backbone == 'GraphSAGE':
             self.conv = GraphSAGE(hidden_lstm, hidden_gnn, num_layers=1)
             self.fc = torch.nn.Linear(hidden_gnn, out_channels)
+        elif self.backbone == 'GraphSAGE_max':
+            self.conv = GraphSAGE(hidden_lstm, hidden_gnn, num_layers=1, aggr='max')
+            self.fc = torch.nn.Linear(hidden_gnn, out_channels)
         elif self.backbone == 'GAT':
             self.conv = GATConv(hidden_lstm, hidden_gnn, heads, dropout=0.6)
-            # self.conv2 = GATConv(hidden_gnn * heads, out_channels, heads=1, concat=False, dropout=0.6)
             self.fc = torch.nn.Linear(hidden_gnn * heads, out_channels)
 
     def forward(self, x, edge_index, edge_weight=None):
         if self.backbone == 'GCN':
             x = F.dropout(x, p=0.5, training=self.training)
             x = self.conv(x, edge_index, edge_weight)
-        elif self.backbone == 'GraphSAGE':
+        elif self.backbone in ['GraphSAGE', 'GraphSAGE_max']:
             x = self.conv(x, edge_index)
         elif self.backbone == 'GAT':
             x = F.dropout(x, p=0.6, training=self.training)
-            # x = F.elu(self.conv1(x, edge_index))
-            # x = F.dropout(x, p=0.6, training=self.training)
             x = self.conv(x, edge_index)
         return x, self.fc(x).sigmoid().squeeze()
+    
+
+def train_lstm(lstm_model):
+    if args.seq_backbone == 'lstm':
+        optimizer = optim.Adam(lstm_model.parameters(), lr=0.00001)
+    elif args.seq_backbone == 'transformer':
+        optimizer = optim.Adam(lstm_model.parameters(), lr=0.0001)
+    else:
+        raise NotImplementedError
+
+    best_auc_val = 0
+    auc_vals, auc_tests = [], []
+    step = 0
+    for epoch in range(1, 51):
+        lstm_model.train()
+        with tqdm(train_loader, desc='Train') as loop:
+            for batch in loop:
+                inputs, labels, lengths, ends, _ = batch
+                lstm_model.zero_grad()
+                _, prob = lstm_model(inputs, lengths, ends)
+                loss = loss_ce(prob.log(), labels)
+                loss.backward()
+                optimizer.step()
+                loop.set_postfix(T=t, epoch=epoch, loss=loss.item())
+        
+        auc_val, _, _ = eval_lstm(lstm_model, val_loader, 'Val')
+        auc_test, _, _ = eval_lstm(lstm_model, test_loader, 'Test')
+        auc_vals.append(auc_val)
+        auc_tests.append(auc_test)
+
+        if auc_val > best_auc_val:
+            best_auc_val = auc_val
+            step = 0
+            torch.save(lstm_model.state_dict(), f'model/{args.seq_backbone}_{args.dataset}_{t}.pkl')
+            print('Save succsessfully.')
+        else:
+            step += 1
+        
+        if step == 10: 
+            break
+
+        print(f'T: {t}, time: {time() - t0}, Epoch: {epoch}, val AUC: {auc_val}, test AUC: {auc_test}')
+
+        plt.figure()
+        plt.plot(range(len(auc_vals)), auc_vals, label='auc_val')
+        plt.plot(range(len(auc_vals)), auc_tests, label='auc_test')
+        plt.legend()
+        plt.savefig(f'fig/{args.seq_backbone}_{args.dataset}_{t}.jpg')
+        plt.close()
 
 
-class Ensemble(torch.nn.Module):
-    def __init__(self, input_size, out_size, hidden_size=32):
-        super().__init__()
-        self.fc1 = torch.nn.Linear(input_size, hidden_size)
-        self.fc2 = torch.nn.Linear(hidden_size, out_size)
-
-    def forward(self, x1, x2):
-        x = torch.cat([x1, x2], dim=1)
-        x = self.fc1(x).relu()
-        x = self.fc2(x)
-        return x.softmax(dim=1)
-
-
-def train_gnn_full(lstm_model, gnn_model, embeds, labels, embeds_val, labels_val, embeds_test, labels_test):
+def train_gnn_batch(lstm_model, gnn_model, embeds, labels, embeds_val, labels_val, embeds_test, labels_test):
     gnn_model.train()
-    gnn_opt = torch.optim.Adam(gnn_model.parameters(), lr=gnn_lr)
+    gnn_opt = torch.optim.Adam(gnn_model.parameters(), lr=0.005)
     
     best_auc_val1 = 0
     auc_vals1, auc_tests1 = [], []
-    # auc_trains1 = []
     step = 0
     idxs = np.random.permutation(range(embeds.shape[0]))
 
-    for epoch in range(1, gnn_epo + 1):
+    for epoch in range(1, 300 + 1):
         batch_num = int(np.ceil(embeds.shape[0] / gnn_batch_size))
         edge_num = 0
 
@@ -127,11 +143,9 @@ def train_gnn_full(lstm_model, gnn_model, embeds, labels, embeds_val, labels_val
         
         auc_val1, _, _ = eval_gnn(lstm_model, gnn_model, embeds, embeds_val, labels_val)
         auc_test1, _, _ = eval_gnn(lstm_model, gnn_model, embeds, embeds_test, labels_test)
-        # auc_train1, _, _ = eval_gnn(lstm_model, gnn_model, embeds, train_loader2)
 
         auc_vals1.append(auc_val1)
         auc_tests1.append(auc_test1)
-        # auc_trains1.append(auc_train1)
 
         if auc_val1 > best_auc_val1:
             best_auc_val1 = auc_val1
@@ -149,64 +163,13 @@ def train_gnn_full(lstm_model, gnn_model, embeds, labels, embeds_val, labels_val
         plt.figure()
         plt.plot(range(len(auc_vals1)), auc_vals1, label='gnn_auc_val')
         plt.plot(range(len(auc_tests1)), auc_tests1, label='gnn_auc_test')
-        # plt.plot(range(len(auc_trains1)), auc_trains1, label='gnn_auc_train')
         plt.legend()
         plt.savefig(f'fig/{args.method}_{args.dataset}_{t}_gnn.jpg')
         plt.close()
-
-    return len(auc_vals1) - step, edge_num/embeds.shape[0]
-
-
-def train_gnn(lstm_model, gnn_model, graph):
-    gnn_opt = torch.optim.Adam(gnn_model.parameters(), lr=gnn_lr)
-    
-    best_auc_val1 = 0
-    auc_vals1, auc_tests1 = [], []
-    auc_trains1 = []
-    step = 0
-    for epoch in range(1, gnn_epo + 1):
-        gnn_model.train()
-        gnn_model.zero_grad()
-        _, prob = gnn_model(graph.x, graph.edge_index)
-        loss = loss_mse(prob, graph.y)
-        loss.backward()
-        gnn_opt.step()
-        print(f'[gnn] epoch={epoch}, loss={loss.item()}')
-        
-        auc_val1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, val_loader)
-        auc_test1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, test_loader)
-        auc_train1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, train_loader2)
-
-        auc_vals1.append(auc_val1)
-        auc_tests1.append(auc_test1)
-        auc_trains1.append(auc_train1)
-
-        if auc_val1 > best_auc_val1:
-            best_auc_val1 = auc_val1
-            step = 0
-            torch.save(gnn_model.state_dict(), f'model/{args.method}_{args.dataset}_{t}_gnn.pkl')
-            print('GNN save succsessfully.')
-        else:
-            step += 1
-        
-        if step == 20:
-            break
-
-        print(f'{args.method}, {args.dataset}, [gnn] T={t}, Epoch={epoch}, val auc={auc_val1:.4f}, test auc={auc_test1:.4f}')
-
-        plt.figure()
-        plt.plot(range(len(auc_vals1)), auc_vals1, label='gnn_auc_val')
-        plt.plot(range(len(auc_tests1)), auc_tests1, label='gnn_auc_test')
-        plt.plot(range(len(auc_trains1)), auc_trains1, label='gnn_auc_train')
-        plt.legend()
-        plt.savefig(f'fig/{args.method}_{args.dataset}_{t}_gnn.jpg')
-        plt.close()
-
-    return len(auc_vals1) - step
 
 
 def train_gnn2(lstm_model, gnn_model, graph, embeds, labels, embeds_val, labels_val, embeds_test, labels_test):
-    gnn_opt = torch.optim.Adam(gnn_model.parameters(), lr=gnn_lr)
+    gnn_opt = torch.optim.Adam(gnn_model.parameters(), lr=0.005)
     
     best_auc_val1 = 0
     auc_vals1, auc_tests1 = [], []
@@ -217,7 +180,7 @@ def train_gnn2(lstm_model, gnn_model, graph, embeds, labels, embeds_val, labels_
     batch_num = int(np.ceil(embeds.shape[0] / gnn_batch_size))
     edge_nums = []
 
-    for epoch in range(1, gnn_epo + 1):
+    for epoch in range(1, 300 + 1):
         train_loss = 0
         edge_num = 0
         for i in range(batch_num):
@@ -239,15 +202,11 @@ def train_gnn2(lstm_model, gnn_model, graph, embeds, labels, embeds_val, labels_
             gnn_opt.step()
             train_loss += loss.item()/batch_num
 
-        # auc_val1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, embeds_val, labels_val)
-        # auc_test1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, embeds_test, labels_test)
-        _, auc_val1, _ = eval_gnn(lstm_model, gnn_model, graph.x, embeds_val, labels_val)
-        _, auc_test1, _ = eval_gnn(lstm_model, gnn_model, graph.x, embeds_test, labels_test)
-        # auc_train1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, train_loader2)
+        auc_val1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, embeds_val, labels_val)
+        auc_test1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, embeds_test, labels_test)
 
         auc_vals1.append(auc_val1)
         auc_tests1.append(auc_test1)
-        # auc_trains1.append(auc_train1)
 
         if auc_val1 > best_auc_val1:
             best_auc_val1 = auc_val1
@@ -261,73 +220,7 @@ def train_gnn2(lstm_model, gnn_model, graph, embeds, labels, embeds_val, labels_
             break
 
         edge_nums.append(edge_num)
-        print(f'{args.method}, {args.dataset}, [gnn] T={t}, Epoch={epoch}, loss={train_loss}, edge_num={edge_num}, sparisty={edge_num/(n_pos+n_neg)/embeds.shape[0]}'
-              f', val auc={auc_val1:.4f}, test auc={auc_test1:.4f}')
-
-        plt.figure()
-        plt.plot(range(len(auc_vals1)), auc_vals1, label='gnn_auc_val')
-        plt.plot(range(len(auc_tests1)), auc_tests1, label='gnn_auc_test')
-        # plt.plot(range(len(auc_trains1)), auc_trains1, label='gnn_auc_train')
-        plt.legend()
-        plt.savefig(f'fig/{args.method}_{args.dataset}_{t}_gnn.jpg')
-        plt.close()
-
-    print(f'edge_num={np.mean(edge_nums)}, sparisty={np.mean(edge_nums)/(n_pos+n_neg)/embeds.shape[0]}')
-
-    return len(auc_vals1) - step
-
-
-def train_gnn3(lstm_model, gnn_model, graph, embeds, labels):
-    gnn_opt = torch.optim.Adam(gnn_model.parameters(), lr=gnn_lr)
-    
-    best_auc_val1 = 0
-    auc_vals1, auc_tests1 = [], []
-    step = 0
-
-    idx = np.random.permutation(range(embeds.shape[0]))
-    batch_num = int(np.ceil(embeds.shape[0] / gnn_batch_size))
-    edge_nums = []
-
-    for epoch in range(1, gnn_epo + 1):
-        train_loss = 0
-        edge_num = 0
-        for i in range(batch_num):
-            embed = embeds[idx[(i-1)*gnn_batch_size: i*gnn_batch_size]]
-            label = labels[idx[(i-1)*gnn_batch_size: i*gnn_batch_size]]
-
-            gnn_model.train()
-            gnn_model.zero_grad()
-            num = graph.x.shape[0]
-
-            new_edge_index = torch.cat([graph.edge_index, epsilon_graph_add(graph.x, embed, num, epsilon)], dim=1)
-            edge_num += new_edge_index.shape[1]
-
-            _, prob = gnn_model(torch.cat([graph.x, embed], dim=0), new_edge_index)
-
-            loss = loss_mse(prob, torch.cat([graph.y, label], dim=0))
-            loss.backward()
-            gnn_opt.step()
-            train_loss += loss.item()/batch_num
-
-        auc_val1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, val_loader)
-        auc_test1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, test_loader)
-
-        auc_vals1.append(auc_val1)
-        auc_tests1.append(auc_test1)
-
-        if auc_val1 > best_auc_val1:
-            best_auc_val1 = auc_val1
-            step = 0
-            torch.save(gnn_model.state_dict(), f'model/{args.method}_{args.dataset}_{t}_gnn.pkl')
-            print('GNN save succsessfully.')
-        else:
-            step += 1
-        
-        if step == 20:
-            break
-
-        edge_nums.append(edge_num)
-        print(f'{args.method}, {args.dataset}, [gnn] T={t}, Epoch={epoch}, loss={train_loss}, edge_num={edge_num}, sparisty={edge_num/(n_pos+n_neg+embeds.shape[0])/embeds.shape[0]}'
+        print(f'{args.method}, {args.dataset}, [gnn] T={t}, Epoch={epoch}, loss={train_loss}, edge_num={edge_num}'
               f', val auc={auc_val1:.4f}, test auc={auc_test1:.4f}')
 
         plt.figure()
@@ -337,184 +230,22 @@ def train_gnn3(lstm_model, gnn_model, graph, embeds, labels):
         plt.savefig(f'fig/{args.method}_{args.dataset}_{t}_gnn.jpg')
         plt.close()
 
-    print(f'edge_num={np.mean(edge_nums)}, sparisty={np.mean(edge_nums)/(n_pos+n_neg)/embeds.shape[0]}')
 
-    return len(auc_vals1) - step
-
-
-def train_gnn4(lstm_model, gnn_model, graph, embeds, labels):
-    gnn_opt = torch.optim.Adam(gnn_model.parameters(), lr=gnn_lr)
-
-    # compress graph pretrain
-    best_auc_val1 = 0
-    auc_vals1, auc_tests1 = [], []
-    auc_trains1 = []
-    step = 0
-    for epoch in range(1, gnn_epo + 1):
-        gnn_model.train()
-        gnn_model.zero_grad()
-        _, prob = gnn_model(graph.x, graph.edge_index)
-        loss = loss_mse(prob, graph.y)
-        loss.backward()
-        gnn_opt.step()
-
-        auc_val1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, val_loader)
-        auc_test1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, test_loader)
-        auc_train1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, train_loader2)
-
-        auc_vals1.append(auc_val1)
-        auc_tests1.append(auc_test1)
-        auc_trains1.append(auc_train1)
-
-        if auc_val1 > best_auc_val1:
-            best_auc_val1 = auc_val1
-            step = 0
-            torch.save(gnn_model.state_dict(), f'model/{args.method}_{args.dataset}_{t}_gnn.pkl')
-            print('GNN save succsessfully.')
-        else:
-            step += 1
-        
-        if step == 40:
-            break
-
-        print(f'{args.method}, {args.dataset}, [gnn-pretrain] T={t}, Epoch={epoch}, loss={loss.item()}, train_auc={auc_train1:.4f}, val auc={auc_val1:.4f}, test auc={auc_test1:.4f}, '
-              f'edge_num={graph.edge_index.shape[1]}, sparisty={graph.edge_index.shape[1]/(n_pos+n_neg)/(n_pos+n_neg)}')
-
-        plt.figure()
-        plt.plot(range(len(auc_vals1)), auc_vals1, label='gnn_auc_val')
-        plt.plot(range(len(auc_tests1)), auc_tests1, label='gnn_auc_test')
-        plt.plot(range(len(auc_trains1)), auc_trains1, label='gnn_auc_train')
-        plt.legend()
-        plt.savefig(f'fig/{args.method}_{args.dataset}_{t}_gnn.jpg')
-        plt.close()
-    
-    # inference graph finetune
-    auc_val1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, val_loader)
-    auc_test1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, test_loader)
-    auc_train1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, train_loader2)
-
-    auc_vals1.append(auc_val1)
-    auc_tests1.append(auc_test1)
-    auc_trains1.append(auc_train1)
-
-    print('='*20)
-    step = 0
-
-    gnn_model.load_state_dict(torch.load(f'model/{args.method}_{args.dataset}_{t}_gnn.pkl'))
-    gnn_opt = torch.optim.Adam(gnn_model.parameters(), lr=gnn_lr)
-
-    idx = np.random.permutation(range(embeds.shape[0]))
-    batch_num = int(np.ceil(embeds.shape[0] / gnn_batch_size))
-
-    for epoch in range(1, gnn_epo + 1):
-        train_loss = 0
-        edge_num = 0
-
-        for i in range(batch_num):
-            embed = embeds[idx[(i-1)*gnn_batch_size: i*gnn_batch_size]]
-            label = labels[idx[(i-1)*gnn_batch_size: i*gnn_batch_size]]
-
-            gnn_model.train()
-            gnn_model.zero_grad()
-            num = graph.x.shape[0]
-
-            new_edge_index = epsilon_graph_add(graph.x, embed, num, epsilon)
-            edge_num += new_edge_index.shape[1]
-
-            _, prob = gnn_model(torch.cat([graph.x, embed], dim=0), new_edge_index)
-            prob = prob[num:]
-
-            loss = loss_mse(prob, label)
-            loss.backward()
-            gnn_opt.step()
-            train_loss += loss.item()/batch_num
-            
-        auc_val1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, val_loader)
-        auc_test1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, test_loader)
-        auc_train1, _, _ = eval_gnn(lstm_model, gnn_model, graph.x, train_loader2)
-
-        auc_vals1.append(auc_val1)
-        auc_tests1.append(auc_test1)
-        auc_trains1.append(auc_train1)
-
-        if auc_val1 > best_auc_val1:
-            best_auc_val1 = auc_val1
-            step = 0
-            torch.save(gnn_model.state_dict(), f'model/{args.method}_{args.dataset}_{t}_gnn.pkl')
-            print('GNN save succsessfully.')
-        else:
-            step += 1
-        
-        if step == 40:
-            break
-        
-        print(f'{args.method}, {args.dataset}, [gnn-finetune] T={t}, Epoch={epoch}, loss={loss.item()}, train auc={auc_train1:.4f}, val auc={auc_val1:.4f}, test auc={auc_test1:.4f}, '
-              f'edge_num={edge_num}, sparisty={edge_num/(n_pos+n_neg)/(embeds.shape[0])}')
-
-        plt.figure()
-        plt.plot(range(len(auc_vals1)), auc_vals1, label='gnn_auc_val')
-        plt.plot(range(len(auc_tests1)), auc_tests1, label='gnn_auc_test')
-        plt.plot(range(len(auc_trains1)), auc_trains1, label='gnn_auc_train')
-        plt.legend()
-        plt.savefig(f'fig/{args.method}_{args.dataset}_{t}_gnn.jpg')
-        plt.close()
-
-    return len(auc_vals1) - step
-    
-
-def train_ensemble(lstm_model, gnn_model, ens_model, X_com):
-    ens_opt = optim.Adam(ens_model.parameters(), lr=ens_lr)
-    ens_model.train()
+@torch.no_grad()
+def eval_lstm(lstm_model, eval_loader, desc):
     lstm_model.eval()
-    gnn_model.eval()
+    label_list = []
+    prob_list = []
+    with tqdm(eval_loader, desc=desc) as loop:
+        for batch in loop:
+            inputs, labels, lengths, ends, _ = batch
+            _, prob = lstm_model(inputs, lengths, ends)
+            label_list.append(labels.cpu().numpy())
+            prob_list.append(prob[:, 1].cpu().numpy())
 
-    best_auc_val2 = 0
-    auc_vals2, auc_tests2 = [], []
-    step = 0
-    for epoch in range(1, ens_epo + 1):
-        for batch in train_loader:
-            with torch.no_grad():
-                input, label, length, end, _ = batch
-                x_lstm, _ = lstm_model(input, length, end)
-
-                num = X_com.shape[0]
-                new_edge_index = epsilon_graph_add(X_com, x_lstm, num, epsilon)
-
-                x_gnn, _ = gnn_model(torch.cat([X_com, x_lstm], dim=0), new_edge_index)
-                x_gnn = x_gnn[num:]
-
-            ens_model.zero_grad()
-            out3 = ens_model(x_lstm, x_gnn)
-            loss = loss_ce(out3.log(), label)
-            loss.backward()
-            ens_opt.step()
-
-        _, _, (auc_val2, _, _) = eval_all(lstm_model, gnn_model, ens_model, X_com, val_loader)
-        _, _, (auc_test2, _, _) = eval_all(lstm_model, gnn_model, ens_model, X_com, test_loader)
-
-        auc_vals2.append(auc_val2)
-        auc_tests2.append(auc_test2)
-
-        if auc_val2 > best_auc_val2:
-            best_auc_val2 = auc_val2
-            step = 0
-            torch.save(ens_model.state_dict(), f'model/{args.method}_{args.dataset}_{t}_ens.pkl')
-            print('ENS save succsessfully.')
-        else:
-            step += 1
-        
-        if step == 5:
-            break
-
-        print(f'{args.method}, {args.dataset}, [ens] T={t}, Epoch={epoch}, val auc={auc_val2:.4f}, test auc={auc_test2:.4f}')
-
-        plt.figure()
-        plt.plot(range(len(auc_vals2)), auc_vals2, label='ens_auc_val')
-        plt.plot(range(len(auc_tests2)), auc_tests2, label='ens_auc_test')
-        plt.legend()
-        plt.savefig(f'fig/{args.method}_{args.dataset}_{t}_ens.jpg')
-        plt.close()
-    return len(auc_vals2) - step
+    label_array = np.concatenate(label_list, axis=0)
+    prob_array = np.concatenate(prob_list, axis=0)
+    return get_auc_ap_rp(label_array, prob_array)
 
 
 @torch.no_grad()
@@ -523,84 +254,40 @@ def eval_gnn(lstm_model, gnn_model, X_com, embeds_eva, labels_eva):
     gnn_model.eval()
 
     prob2s = np.empty(0)
-
     batch_num = int(np.ceil(embeds_eva.shape[0] / gnn_batch_size))
-    # for batch in eval_loader:
     for i in range(batch_num):
         x_lstm = embeds_eva[i*gnn_batch_size: (i+1)*gnn_batch_size]
-
-        # input, label, length, end, _ = batch
-        # x_lstm, _ = lstm_model(input, length, end)
 
         num = X_com.shape[0]
         new_edge_index = epsilon_graph_add(X_com, x_lstm, num, epsilon)
 
         _, prob2 = gnn_model(torch.cat([X_com, x_lstm], dim=0), new_edge_index)
         prob2 = prob2[num:]
-
-        # labels = np.concatenate([labels, label.cpu().numpy()], axis=0)
         prob2s = np.concatenate([prob2s, prob2.cpu().numpy()], axis=0)
-    # print(labels_eva.shape, prob2s.shape)
 
     return get_auc_ap_rp(labels_eva, prob2s)
 
 
-@torch.no_grad()
-def eval_all(lstm_model, gnn_model, ens_model, X_com, eval_loader):
-    lstm_model.eval()
-    gnn_model.eval()
-    ens_model.eval()
-
-    labels = np.empty(0)
-    prob1s = np.empty(0)
-    prob2s = np.empty(0)
-    prob3s = np.empty(0)
-
-    for batch in eval_loader:
-        input, label, length, end, _ = batch
-        x_lstm, out1 = lstm_model(input, length, end)
-        prob1 = out1[:, 1].detach()
-
-        num = X_com.shape[0]
-        new_edge_index = epsilon_graph_add(X_com, x_lstm, num, epsilon)
-
-        x_gnn, prob2 = gnn_model(torch.cat([X_com, x_lstm], dim=0), new_edge_index)
-        x_gnn, prob2 = x_gnn[num:], prob2[num:]
-
-        out3 = ens_model(x_lstm, x_gnn)
-        prob3 = out3[:, 1].detach()
-
-        labels = np.concatenate([labels, label.cpu().numpy()], axis=0)
-        prob1s = np.concatenate([prob1s, prob1.cpu().numpy()], axis=0)
-        prob2s = np.concatenate([prob2s, prob2.cpu().numpy()], axis=0)
-        prob3s = np.concatenate([prob3s, prob3.cpu().numpy()], axis=0)
-
-    return get_auc_ap_rp(labels, prob1s), get_auc_ap_rp(labels, prob2s), get_auc_ap_rp(labels, prob3s)
-
-
 def run():
-    # LSTM
-    if args.backbone == 'lstm':
+    # sequence embedding extractor
+    if args.seq_backbone == 'lstm':
         lstm_model = LSTM(input_size, hidden_size, 2, layer_num).to(device)
-    elif args.backbone == 'xlstm':
-        lstm_model = xLSTM(input_size, hidden_size, 2, layer_num).to(device)
-    elif args.backbone == 'transformer':
+    elif args.seq_backbone == 'transformer':
         lstm_model = vanilla_transformer_encoder(input_dim=input_size, hidden_dim=32, d_model=32,  MHD_num_head=4, d_ff=2*32, output_dim=2).to(device)
     else:
         raise NotImplementedError
     
-    lstm_model.load_state_dict(torch.load(f'model/{args.backbone}_{args.dataset}_{t}.pkl'))
-    print(f'{args.backbone} load succsessfully.')
-
-    # lstm_model = LSTM(input_size, hidden_size, 2, layer_num).to(device)
-    # lstm_model.load_state_dict(torch.load(f'model/lstm_{args.dataset}_{t}.pkl'))
-    # print('LSTM load succsessfully.')
+    if not os.path.exists(f'model/{args.seq_backbone}_{args.dataset}_{t}.pkl'):
+        train_lstm(lstm_model)
+    
+    lstm_model.load_state_dict(torch.load(f'model/{args.seq_backbone}_{args.dataset}_{t}.pkl'))
+    print(f'{args.seq_backbone} load succsessfully.')
+    auc0, ap0, rp0 = eval_lstm(lstm_model, test_loader, 'Test')
 
     with torch.no_grad():
         lstm_model.eval()
         embeds = np.empty((0, hidden_size))
         labels = np.empty(0)
-
         for batch in train_loader2:
             input, label, length, end, _ = batch
             lstm_model.zero_grad()
@@ -608,42 +295,32 @@ def run():
             embeds = np.concatenate([embeds, embed.cpu().numpy()], axis=0)
             labels = np.concatenate([labels, label.cpu().numpy()], axis=0)
 
-    with torch.no_grad():
-        lstm_model.eval()
         embeds_val = np.empty((0, hidden_size))
         labels_val = np.empty(0)
-
         for batch in val_loader:
             input, label, length, end, _ = batch
             lstm_model.zero_grad()
             embed, _ = lstm_model(input, length, end)
             embeds_val = np.concatenate([embeds_val, embed.cpu().numpy()], axis=0)
             labels_val = np.concatenate([labels_val, label.cpu().numpy()], axis=0)
-
         embeds_val = torch.tensor(embeds_val).float().to(device)
-        # labels_val = torch.tensor(labels_val).float().to(device)
 
-    with torch.no_grad():
-        lstm_model.eval()
         embeds_test = np.empty((0, hidden_size))
         labels_test = np.empty(0)
-
         for batch in test_loader:
             input, label, length, end, _ = batch
             lstm_model.zero_grad()
             embed, _ = lstm_model(input, length, end)
             embeds_test = np.concatenate([embeds_test, embed.cpu().numpy()], axis=0)
             labels_test = np.concatenate([labels_test, label.cpu().numpy()], axis=0)
-
         embeds_test = torch.tensor(embeds_test).float().to(device)
-        # labels_test = torch.tensor(labels_test).float().to(device)
 
-    if 'ECSeq' in args.method:
-        # compress
+    # graph compression
+    if args.method == 'ECSeq':
         if args.compress == 'kmeans_ba':
-            phi = kmeans_ba(embeds, labels, n_pos=n_pos, n_neg=n_neg)
+            phi = kmeans_ba(embeds, labels, n_pos=args.n_pos, n_neg=args.n_neg)
         elif args.compress == 'kmeans_no':
-            phi = kmeans_no(embeds, n_cluster=n_cluster)
+            phi = kmeans_no(embeds, n_cluster=1000)
         elif args.compress == 'AGC':
             edge_index_ori = epsilon_graph(torch.tensor(embeds, dtype=torch.float), epsilon).to(device)
             print(f'ori, nodes={embeds.shape[0]}, deg={edge_index_ori.shape[1]/embeds.shape[0]}')
@@ -652,13 +329,13 @@ def run():
         elif args.compress == 'Grain':
             edge_index_ori = epsilon_graph(torch.tensor(embeds, dtype=torch.float), 0.95).to(device)
             print(f'ori, nodes={embeds.shape[0]}, deg={edge_index_ori.shape[1]/embeds.shape[0]}')
-            grain = Grain(torch.tensor(embeds, dtype=torch.float), edge_index_ori, num_coreset=n_cluster)
+            grain = Grain(torch.tensor(embeds, dtype=torch.float), edge_index_ori, num_coreset=200)
             phi, n_cluster2 = grain.get_phi()
             print(n_cluster2)
         elif args.compress == 'Loukas':
             edge_index_ori = epsilon_graph(torch.tensor(embeds, dtype=torch.float), epsilon).to(device)
             print(f'ori, nodes={embeds.shape[0]}, deg={edge_index_ori.shape[1]/embeds.shape[0]}')
-            loukas = Loukas(torch.tensor(embeds, dtype=torch.float), edge_index_ori, n_cluster)
+            loukas = Loukas(torch.tensor(embeds, dtype=torch.float), edge_index_ori, 1000)
             phi = loukas.get_phi()
         else: 
             raise NotImplementedError
@@ -680,99 +357,51 @@ def run():
         labels = torch.tensor(labels, device=device, dtype=torch.float)
         X_com = embeds
 
-    # GNN
-    gnn_model = GNN(hidden_size, hidden_size_gnn, 1, 'GraphSAGE').to(device)
+    # graph mining
+    gnn_model = GNN(hidden_size, hidden_size_gnn, 1, args.gnn_backbone).to(device)
 
-    if not os.path.exists(f'model/{args.method}_{args.dataset}_5_gnn.pkl') or update:
-        if args.method == 'ECSeq':  # compress graph
-            best_epoch1 = train_gnn(lstm_model, gnn_model, com_graph)
-        elif args.method == 'ECSeq2':  # inference graph
-            best_epoch1 = train_gnn2(lstm_model, gnn_model, com_graph, embeds, labels, embeds_val, labels_val, embeds_test, labels_test)
-        elif args.method == 'ECSeq3':  # compress graph + inference graph
-            best_epoch1 = train_gnn3(lstm_model, gnn_model, com_graph, embeds, labels)
-        elif args.method == 'ECSeq4':  # compress graph pretrain + inference graph finetune
-            best_epoch1 = train_gnn4(lstm_model, gnn_model, com_graph, embeds, labels)
-        elif args.method == 'fullGNN':  # full graph
-            best_epoch1, degree = train_gnn_full(lstm_model, gnn_model, embeds, labels, embeds_val, labels_val, embeds_test, labels_test)
+    if args.method == 'ECSeq':
+        train_gnn2(lstm_model, gnn_model, com_graph, embeds, labels, embeds_val, labels_val, embeds_test, labels_test)
+    elif args.method == 'batchGNN': 
+        train_gnn_batch(lstm_model, gnn_model, embeds, labels, embeds_val, labels_val, embeds_test, labels_test)
 
     gnn_model.load_state_dict(torch.load(f'model/{args.method}_{args.dataset}_{t}_gnn.pkl'))
     print('GNN load succsessfully.')
+ 
+    auc1, ap1, rp1 = eval_gnn(lstm_model, gnn_model, X_com, embeds_test, labels_test)
 
-    if args.ensemble:
-        # Ensemble
-        ens_model = Ensemble(hidden_size + hidden_size_gnn, 2).to(device)
-        # if not os.path.exists(f'model/{args.method}_{args.dataset}_5_ens.pkl') or update:
-        #     best_epoch2 = train_ensemble(lstm_model, gnn_model, ens_model, X_com)
-        # ens_model.load_state_dict(torch.load(f'model/{args.method}_{args.dataset}_{t}_ens.pkl'))
-        # print('ENS load succsessfully.')
-        # # evaluate
-        best_epoch2 = 0
-        (auc0, f10, rp0), (auc1, f11, rp1), (auc2, f12, rp2) = eval_all(lstm_model, gnn_model, ens_model, X_com, test_loader)
-    
-    else:
-        auc1, f11, rp1 = eval_gnn(lstm_model, gnn_model, X_com, embeds_test, labels_test)
-        auc0, f10, rp0, best_epoch2, auc2, f12, rp2 = 0, 0, 0, 0, 0, 0, 0
-
-    return auc0, f10, rp0, best_epoch1, auc1, f11, rp1, best_epoch2, auc2, f12, rp2, degree
+    return auc0, ap0, rp0, auc1, ap1, rp1
 
 
 if __name__ == '__main__':
     seed_everything(42)
-    hidden_size = 256
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default='FD2')
+    parser.add_argument("--seq_backbone", type=str, default='lstm')  # lstm, transformer
+    parser.add_argument("--gnn_backbone", type=str, default='GraphSAGE')  # GraphSAGE, GraphSAGE_max, GCN, GAT
+    parser.add_argument("--epsilon", type=float, default=0.99)  # epsilon-graph
+    parser.add_argument("--method", type=str, default='ECSeq')  # ECSeq, batchGNN
+    parser.add_argument("--compress", type=str, default='kmeans_ba')  # kmeans_ba, kmeans_no, AGC, Grain, Loukas
+    parser.add_argument("--n_pos", type=int, default=200)  # number of positive compressed nodes
+    parser.add_argument("--n_neg", type=int, default=800)  # number of negative compressed nodes
+    args = parser.parse_args()
+
+    hidden_size = 256 if args.method == 'lstm' else 32
     hidden_size_gnn = 32
     layer_num = 1
     batch_size = 64
     gnn_batch_size = 1000
-
-    # gnn_lr = 0.0005
-    gnn_lr = 0.005  # ECSeq
-    # gnn_lr = 0.01  # fullGNN
-    ens_lr = 0.0001
-
-    ens_epo = 50
-    gnn_epo = 300
-    update = True
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default='HK')  # HK, LZD
-    parser.add_argument("--compress", type=str, default='kmeans_ba')  # kmeans_ba, kmeans_no, AGC, Grain, Loukas
-    parser.add_argument("--method", type=str, default='ECSeq2') 
-    parser.add_argument("--backbone", type=str, default='transformer')  # lstm
-    parser.add_argument("--ensemble", type=bool, default=True) 
-    parser.add_argument("--ratio", type=float, default=1.0) 
-    args = parser.parse_args()
-
-    n_cluster = 1000
-
-    # epsilon = 0.98 if args.dataset == 'LZD' else 0.99 
-    # epsilon = 0.95 if args.dataset == 'LZD' else 0.99  
-    epsilon = 0.98 
-
-    with open('params.json', 'r', encoding='utf-8') as f:
-        params = json.load(f)
-        n_pos = params[args.dataset]["n_pos"]
-        n_neg = params[args.dataset]["n_neg"]
-    
-    n_pos = int(n_pos*args.ratio)
-    n_neg = int(n_neg*args.ratio)
+    epsilon = args.epsilon
        
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
-
-    if args.backbone == 'transformer':
-        epsilon = 0.99
-        hidden_size = 32
-        def collate_fn(batch):
-            inputs, labels, lengths, ends, idxs = zip(*batch)
-            inputs_pad = pad_sequence(inputs, batch_first=True)
-            return inputs_pad.float().to(device), torch.LongTensor(labels).to(device), torch.LongTensor(lengths), \
-                torch.stack(ends, dim=0).float().to(device), torch.LongTensor(idxs).to(device)
-        train_loader, train_loader2, val_loader, test_loader, input_size = get_dataset(args, batch_size, device, collate_fn=collate_fn)
-    else:
-        train_loader, train_loader2, val_loader, test_loader, input_size = get_dataset(args, batch_size, device)
+    print(args)
 
     loss_ce = torch.nn.NLLLoss()
     loss_mse = torch.nn.MSELoss()
+
+    train_loader, train_loader2, val_loader, test_loader, input_size = get_dataset(args, batch_size, device)
 
     results = []
     t0 = time()
@@ -781,24 +410,20 @@ if __name__ == '__main__':
         res = run()
         results.append(res)
         with open('results.txt', 'a') as f:
-            f.write(f'{args.method} final, time: {time() - t0}, {args.dataset}, deg={res[11]:.4f}, '
-                    f'[lstm] auc={res[0]:.4f}, f1={res[1]:.4f}, rp={res[2]:.4f}, '
-                    f'[gnn] epoch={res[3]}, auc={res[4]:.4f}, f1={res[5]:.4f}, rp={res[6]:.4f}, '
-                    f'[ens] epoch={res[7]}, auc={res[8]:.4f}, f1={res[9]:.4f}, rp={res[10]:.4f}\n')
+            f.write(f'{args.method} final, time: {time() - t0}, {args.dataset}, '
+                    f'[lstm] auc={res[0]:.4f}, ap={res[1]:.4f}, rp={res[2]:.4f}, '
+                    f'[gnn] auc={res[3]:.4f}, ap={res[4]:.4f}, rp={res[5]:.4f}\n')
             f.flush()
     results = np.array(results)
     mean = np.mean(results, axis=0)
     std = np.std(results, axis=0)
 
     with open('results.txt', 'a') as f:
-        f.write(f'{args.method} final avg, time: {time() - t0}, {args.dataset}, deg={mean[11]:.4f}, '
+        f.write(f'{args.method} final avg, time: {time() - t0}, {args.dataset}, '
                 f'[lstm] {mean[0]:.4f}±{std[0]:.4f}, {mean[1]:.4f}±{std[1]:.4f}, {mean[2]:.4f}±{std[2]:.4f}, '
-                f'[gnn] epoch={mean[3]}, {mean[4]:.4f}±{std[4]:.4f}, {mean[5]:.4f}±{std[5]:.4f}, {mean[6]:.4f}±{std[6]:.4f}, '
-                f'[ens] epoch={mean[7]}, {mean[8]:.4f}±{std[8]:.4f}, {mean[9]:.4f}±{std[9]:.4f}, {mean[10]:.4f}±{std[10]:.4f}\n')
+                f'[gnn] {mean[3]:.4f}±{std[3]:.4f}, {mean[4]:.4f}±{std[4]:.4f}, {mean[5]:.4f}±{std[5]:.4f}\n')
         f.flush()
     
-    
-    print(f'{args.method} final avg, time: {time() - t0}, {args.dataset}, deg={mean[11]:.4f}, '
+    print(f'{args.method} final avg, time: {time() - t0}, {args.dataset}, '
           f'[lstm] {mean[0]:.4f}±{std[0]:.4f}, {mean[1]:.4f}±{std[1]:.4f}, {mean[2]:.4f}±{std[2]:.4f}, '
-          f'[gnn] epoch={mean[3]}, {mean[4]:.4f}±{std[4]:.4f}, {mean[5]:.4f}±{std[5]:.4f}, {mean[6]:.4f}±{std[6]:.4f}, '
-          f'[ens] epoch={mean[7]}, {mean[8]:.4f}±{std[8]:.4f}, {mean[9]:.4f}±{std[9]:.4f}, {mean[10]:.4f}±{std[10]:.4f}')
+          f'[gnn] {mean[3]:.4f}±{std[3]:.4f}, {mean[4]:.4f}±{std[4]:.4f}, {mean[5]:.4f}±{std[5]:.4f}')
