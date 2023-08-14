@@ -14,7 +14,6 @@
 3. Run *ECSeq* on *Bike* dataset:
 
     ```shell
-    pip install -r requirements.txt
     python ECSeq_traffic.py --dataset=bike_nyc --method=ECSeq
     ```
 
