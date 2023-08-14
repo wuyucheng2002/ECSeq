@@ -1,17 +1,26 @@
 ## Efficient User Behavior Sequential Learning with Compressed Graph Neural Networks
 
-### Running Examples
+### Instructions 
 
-Run *ECSeq* on *Bike* dataset:
+1. Download the datasets in `data` folder and unzip it.
 
-```shell
-pip install -r requirements.txt
-python ECSeq_traffic.py --dataset=bike_nyc --method=ECSeq
-```
+2. Install dependencies:
 
-The results will be printed, and also saved in `results.txt`; models will be saved in `model` folder; figures of evaluation results will be saved in `fig` folder.
+   ```shell
+   pip install -r requirements.txt
+   ```
 
-If you want to retrain the models, please empty the `model` folder first.
+
+3. Run *ECSeq* on *Bike* dataset:
+
+    ```shell
+    pip install -r requirements.txt
+    python ECSeq_traffic.py --dataset=bike_nyc --method=ECSeq
+    ```
+
+    The results will be printed, and also saved in `results.txt`; models will be saved in `model` folder; figures of evaluation results will be saved in `fig` folder.
+
+    If you want to retrain the models, please empty the `model` folder first.
 
 ### Arguments Description
 
