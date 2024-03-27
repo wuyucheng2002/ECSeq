@@ -29,7 +29,7 @@
 | seq_backbone | lstm          | Sequence embedding extractor backbone, can be chosen from {'lstm', 'transformer'}. |
 | gnn_backbone | GraphSAGE     | Graph mining backbone, can be chosen from {'GraphSAGE', 'GraphSAGE_max', 'GCN', 'GAT'}. |
 | method       | ECSeq         | 'ECSeq': use ECSeq framework; 'batchGNN': don't use ECSeq and train GNN on graph batchs. |
-| compress     | kmeans_no     | Graph compression algorithm, can be chosen from {'kmeans', 'AGC', 'Grain', 'Loukas'}. |
+| compress     | kmeans_no     | Graph compression algorithm, can be chosen from {'kmeans', 'AGC', 'Grain', 'RSA'}. |
 | n_cluster    | 100           | Number of clusters/new nodes.                                |
 
 ### References
