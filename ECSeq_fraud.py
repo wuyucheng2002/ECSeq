@@ -332,7 +332,7 @@ def run():
             grain = Grain(torch.tensor(embeds, dtype=torch.float), edge_index_ori, num_coreset=200)
             phi, n_cluster2 = grain.get_phi()
             print(n_cluster2)
-        elif args.compress == 'Loukas':
+        elif args.compress == 'RSA':
             edge_index_ori = epsilon_graph(torch.tensor(embeds, dtype=torch.float), epsilon).to(device)
             print(f'ori, nodes={embeds.shape[0]}, deg={edge_index_ori.shape[1]/embeds.shape[0]}')
             loukas = Loukas(torch.tensor(embeds, dtype=torch.float), edge_index_ori, 1000)
@@ -382,9 +382,9 @@ if __name__ == '__main__':
     parser.add_argument("--gnn_backbone", type=str, default='GraphSAGE')  # GraphSAGE, GraphSAGE_max, GCN, GAT
     parser.add_argument("--epsilon", type=float, default=0.99)  # epsilon-graph
     parser.add_argument("--method", type=str, default='ECSeq')  # ECSeq, batchGNN
-    parser.add_argument("--compress", type=str, default='kmeans_ba')  # kmeans_ba, kmeans_no, AGC, Grain, Loukas
-    parser.add_argument("--n_pos", type=int, default=200)  # number of positive compressed nodes
-    parser.add_argument("--n_neg", type=int, default=800)  # number of negative compressed nodes
+    parser.add_argument("--compress", type=str, default='kmeans_ba')  # kmeans_ba, kmeans_no, AGC, Grain, RSA
+    parser.add_argument("--n_pos", type=int, default=100)  # number of positive compressed nodes
+    parser.add_argument("--n_neg", type=int, default=400)  # number of negative compressed nodes
     args = parser.parse_args()
 
     hidden_size = 256 if args.method == 'lstm' else 32
