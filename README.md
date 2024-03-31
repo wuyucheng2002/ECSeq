@@ -1,4 +1,4 @@
-## Efficient User Behavior Sequential Learning with Compressed Graph Neural Networks
+## Efficient User Sequence Learning for Online Services via Compressed Graph Neural Networks
 
 ### Instructions 
 
